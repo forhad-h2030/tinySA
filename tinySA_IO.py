@@ -27,11 +27,21 @@ OUT = "bins.csv"
 MAX_SCAN = 250     # the tinySA rejects large scans, so longer grids are stitched
 
 
-def find_port():
+def find_ports():
+    """Serial ports that look like a tinySA, best match first (macOS, Windows and Linux)."""
+    ranked = []
     for p in serial.tools.list_ports.comports():
-        if p.vid == VID or "usbmodem" in p.device or "ttyACM" in p.device:
-            return p.device
-    raise RuntimeError("No tinySA found. Is it plugged in with a data cable?")
+        text = f"{p.description} {p.manufacturer} {p.product}".lower()
+        if p.vid == VID:
+            rank = 0
+        elif "tinysa" in text or "stm" in text:
+            rank = 1
+        elif "usbmodem" in p.device or "ttyACM" in p.device:
+            rank = 2
+        else:
+            continue
+        ranked.append((rank, p.device))
+    return [dev for _, dev in sorted(ranked)]
 
 
 def _number(token):
@@ -44,20 +54,28 @@ def _number(token):
 
 class TinySA:
     def __init__(self, port=None, tries=5):
-        port = port or find_port()
+        candidates = [port] if port else find_ports()
+        if not candidates:
+            seen = ", ".join(f"{p.device} ({p.description})" for p in serial.tools.list_ports.comports()) or "none"
+            raise RuntimeError(f"No tinySA found (serial ports seen: {seen}). "
+                               "Is it plugged in with a data cable? Try --port COMx.")
         err = None
         for _ in range(tries):  # the first open often fails right after enumeration
-            try:
-                self.ser = serial.Serial(port, 115200, timeout=0.5)
-                time.sleep(0.3)
-                self.cmd("version", 3)
-                self.cmd("trace dBm", 3)  # scan units follow the display unit, so force dBm
-                self.cmd("pause")
-                return
-            except Exception as e:
-                err = e
-                time.sleep(1)
-        raise RuntimeError(f"Could not open the tinySA on {port}: {err}")
+            for dev in candidates:
+                self.ser = None
+                try:
+                    self.ser = serial.Serial(dev, 115200, timeout=0.5)
+                    time.sleep(0.3)
+                    self.cmd("version", 3)
+                    self.cmd("trace dBm", 3)  # scan units follow the display unit, so force dBm
+                    self.cmd("pause")
+                    return
+                except Exception as e:
+                    err = e
+                    if self.ser:
+                        self.ser.close()  # Windows ports are exclusive, so release before retrying
+            time.sleep(1)
+        raise RuntimeError(f"Could not open the tinySA on {', '.join(candidates)}: {err}")
 
     def cmd(self, text, timeout=15.0):
         """Send a command, return its response lines."""
@@ -105,7 +123,7 @@ class TinySA:
 
 def main():
     p = argparse.ArgumentParser(description="Read power per bin from a tinySA.")
-    p.add_argument("--port", help="serial port (default: auto-detect)")
+    p.add_argument("--port", help="serial port, e.g. COM3 (default: auto-detect)")
     p.add_argument("--center", type=float, default=CENTER_HZ, help=f"center frequency, Hz (default {CENTER_HZ:g})")
     p.add_argument("--span", type=float, default=SPAN_HZ, help=f"span, Hz (default {SPAN_HZ:g})")
     p.add_argument("--bins", type=int, default=BINS, help=f"number of bins (default {BINS})")
@@ -126,5 +144,7 @@ def main():
             w.writerow(["bin", "center_mhz", "freq_mhz", "dbm", "mw"])
             w.writerows([i, f"{a.center / 1e6:.6f}", f"{fr / 1e6:.6f}", f"{d:.3f}", f"{mw:.6g}"]
                         for i, fr, d, mw in rows)
+
+
 if __name__ == "__main__":
     main()
